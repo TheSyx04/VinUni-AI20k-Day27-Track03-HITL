@@ -1,0 +1,230 @@
+# Day27 — Track 3: HITL PR Review Agent
+
+A 2-hour lab that builds a human-in-the-loop pull-request review agent in **LangGraph**, end-to-end.
+
+> 1. Agent reads a PR, analyzes code changes, proposes review comments.
+> 2. Confidence ~72% → show diff + reasoning → user approves → agent commits the review.
+> 3. Confidence ~58% → escalate: show context + specific questions for the reviewer.
+> 4. Every interaction is written to a PostgreSQL audit trail; full sessions can be replayed.
+
+Students complete **4 exercises** (`exercises/`) that together build the full system. Each exercise has a runnable skeleton with `# TODO:` markers — your job is to fill them in.
+
+## Confidence routing
+
+| Confidence  | Branch           | Has HITL?                          | Demo PR |
+|-------------|------------------|------------------------------------|---------|
+| ≥ 85%       | `auto_approve`   | No — agent commits directly        | (use any tiny PR) |
+| 60–85%      | `human_approval` | Yes — approve / reject / edit      | PR-Demo #1 |
+| < 60%       | `escalate`       | Yes — answer specific questions    | PR-Demo #2 |
+
+Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.85`, `ESCALATE_THRESHOLD = 0.60`).
+
+## Layout
+
+```
+.
+├── README.md                # this file — the only documentation
+├── pyproject.toml
+├── .env.example
+├── docker-compose.yml       # Postgres for checkpointer + audit
+├── start_all.sh             # bring up Postgres
+│
+├── common/                  # shared utilities — provided, don't modify
+│   ├── llm.py               # ChatOpenAI factory (OpenRouter)
+│   ├── github.py            # `gh` CLI wrapper: fetch_pr / post_review_comment
+│   ├── db.py                # async connection pool + write_audit_event
+│   └── schemas.py           # ReviewState (TypedDict) + PRAnalysis (Pydantic)
+│
+├── exercises/               # YOUR WORK — skeleton code with TODOs
+│   ├── exercise_1_confidence.py
+│   ├── exercise_2_hitl.py
+│   ├── exercise_3_escalation.py
+│   └── exercise_4_audit.py
+│
+└── audit/                   # provided
+    ├── schema.sql           # CREATE TABLE audit_events
+    └── replay.py            # `python -m audit.replay --thread <id>` / --list
+```
+
+## Prerequisites
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
+- Docker (for Postgres — only needed for exercise 4)
+- [`gh` CLI](https://cli.github.com/) — binary only, you'll auth via `GITHUB_TOKEN` below
+- An [OpenRouter](https://openrouter.ai/keys) API key (free tier has $1 credit)
+- A GitHub Personal Access Token — see next section
+
+## Get a GitHub Personal Access Token (PAT)
+
+The agent shells out to the `gh` CLI both to **read PR diffs** and to **post review comments** back to the PR.
+
+1. Open <https://github.com/settings/tokens/new> (classic — simplest).
+2. Fill in:
+   - **Note:** `Day27 HITL Lab`
+   - **Expiration:** 30 days
+   - **Scopes:** tick **`public_repo`** (enough for `VinUni-AI20k/PR-Demo` since it's a public repo).
+3. Click **Generate token** → copy the `ghp_...` value immediately (shown only once).
+4. Paste into `.env`:
+   ```bash
+   echo "GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" >> .env
+   ```
+5. Verify:
+   ```bash
+   GITHUB_TOKEN=$(grep ^GITHUB_TOKEN .env | cut -d= -f2) \
+     gh repo view VinUni-AI20k/PR-Demo
+   ```
+   If you see repo metadata → OK. `HTTP 401` → wrong scope or typo.
+
+**Security:** `.env` is git-ignored. Each student uses **their own** PAT — comments show their username, so the instructor can see who approved what.
+
+## Setup (once)
+
+```bash
+git clone <lab-repo-url> && cd Day27-Track3-HITL
+./start_all.sh                              # docker compose up Postgres (needed for exercise 4 only)
+uv sync                                     # install Python deps
+cp .env.example .env && $EDITOR .env        # set OPENROUTER_API_KEY and GITHUB_TOKEN
+```
+
+Exercises 1–3 don't need Postgres — you can skip `./start_all.sh` until exercise 4.
+
+## Demo PRs
+
+Two PRs are kept at the public repo **<https://github.com/VinUni-AI20k/PR-Demo>** for testing:
+
+| PR | URL                                                                  | Expected branch          |
+|----|----------------------------------------------------------------------|--------------------------|
+| #1 — Add task priority field        | `https://github.com/VinUni-AI20k/PR-Demo/pull/1` | `human_approval` (~70%) |
+| #2 — Add user login + cloud sync    | `https://github.com/VinUni-AI20k/PR-Demo/pull/2` | `escalate` (<60%)       |
+
+PR #1 is mechanical (~40 lines) with one open question (schema migration). PR #2 has multiple red flags (MD5 password hashing, plaintext token storage, SQL injection in `Storage.add`, hard-coded user_id, no tests for new code) — the LLM should drop into the escalate branch and ask the reviewer specific questions.
+
+## The 4 exercises
+
+Do them in order — each builds on the previous. Open the file, read all `# TODO:` comments top-to-bottom, fill them in, then run the command shown.
+
+### Exercise 1 — Confidence routing (`exercise_1_confidence.py`)
+
+Build a small LangGraph that fetches a PR, analyzes it, then routes to one of three terminal nodes by confidence (`auto_approve` / `human_approval` / `escalate`). No HITL yet — terminals just print which branch fired.
+
+**You implement:** `node_analyze` (call LLM with `with_structured_output(PRAnalysis)`), `node_route` (return decision string), and the graph wiring (`add_node`, `add_edge`, `add_conditional_edges`).
+
+```bash
+uv run python exercises/exercise_1_confidence.py --pr https://github.com/VinUni-AI20k/PR-Demo/pull/1
+uv run python exercises/exercise_1_confidence.py --pr https://github.com/VinUni-AI20k/PR-Demo/pull/2
+```
+
+Success = the two PRs print **different** branches.
+
+### Exercise 2 — HITL with `interrupt()` (`exercise_2_hitl.py`)
+
+Turn the `human_approval` node from a placeholder into a real pause-and-ask. Use `interrupt(payload)` inside the node, then resume the graph from `main()` with `Command(resume=<user_answer>)`.
+
+**You implement:** `node_human_approval` (call `interrupt()` with diff + reasoning), graph compile with `MemorySaver` checkpointer, and the resume loop in `main()`:
+```python
+while "__interrupt__" in result:
+    payload = result["__interrupt__"][0].value
+    answer = prompt_human(payload)
+    result = app.invoke(Command(resume=answer), cfg)
+```
+
+```bash
+uv run python exercises/exercise_2_hitl.py --pr https://github.com/VinUni-AI20k/PR-Demo/pull/1
+# → terminal pauses, shows a green panel, asks approve / reject / edit
+```
+
+### Exercise 3 — Escalation with reviewer Q&A (`exercise_3_escalation.py`)
+
+When confidence is low, the agent shouldn't ask "approve/reject" — it should ask **specific questions** to gather context, then re-run the analysis with the answers.
+
+**You implement:** prompt the LLM to populate `escalation_questions` when low-confidence, `node_escalate` (calls `interrupt(kind="escalation")` with the questions), and `node_synthesize` (re-prompts the LLM using the reviewer's answers to produce a refined review).
+
+```bash
+uv run python exercises/exercise_3_escalation.py --pr https://github.com/VinUni-AI20k/PR-Demo/pull/2
+# → terminal shows a yellow panel; type an answer for each question
+```
+
+### Exercise 4 — Structured PostgreSQL audit trail (`exercise_4_audit.py`)
+
+Needs Postgres running (`./start_all.sh`). Swap `MemorySaver` for `AsyncPostgresSaver` so the graph can resume after a crash, **and** at every meaningful node event, write one structured row to `audit_events` using the `AuditEntry` Pydantic model defined in `common/schemas.py`:
+
+```python
+class AuditEntry(BaseModel):
+    timestamp: datetime          # auto: datetime.now(timezone.utc)
+    agent_id: str                # e.g. "pr-review-agent@v0.1"
+    action: str                  # "fetch_pr" | "analyze" | "route" | "human_approval" | ...
+    confidence: float            # 0.0 – 1.0
+    risk_level: str              # "low" | "med" | "high"  (use risk_level_for(confidence))
+    reviewer_id: str | None      # GitHub username on HITL steps, None otherwise
+    decision: str                # "auto" | "approve" | "reject" | "edit" | "escalate" | "pending"
+    reason: str | None           # LLM reasoning OR human feedback
+    execution_time_ms: int       # measure with time.monotonic() per node
+```
+
+Each field maps to a first-class SQL column, so auditors can query directly:
+```sql
+SELECT AVG(confidence) FROM audit_events WHERE decision = 'approve';
+SELECT * FROM audit_events WHERE risk_level = 'high' AND decision = 'auto';   -- shouldn't happen!
+```
+
+**You implement:** the `audit(...)` helper (calls `write_audit_event(_pool, thread_id=..., pr_url=..., entry=AuditEntry(...))`), construct an `AuditEntry` in every node (a skeleton with all fields is commented above each TODO), and replace `MemorySaver` with `AsyncPostgresSaver.from_conn_string(database_url())` inside an `async with` block.
+
+```bash
+uv run python exercises/exercise_4_audit.py --pr https://github.com/VinUni-AI20k/PR-Demo/pull/1
+# → after the run, replay the full session:
+uv run python -m audit.replay --thread <thread_id-printed-above>
+uv run python -m audit.replay --list   # see recent threads
+```
+
+#### Why two storage mechanisms?
+
+| Mechanism                              | Purpose                              | Schema             | Audience          |
+|----------------------------------------|---------------------------------------|--------------------|-------------------|
+| LangGraph **checkpointer** (Postgres)  | Resume graph after crash, time-travel | Binary blob        | LangGraph runtime |
+| Table **`audit_events`**               | Structured decision log               | First-class columns (queryable) | Auditors, humans  |
+
+The assignment line "ghi vào PostgreSQL audit trail" is fulfilled by `audit_events`. The checkpointer is a free bonus from using `AsyncPostgresSaver`.
+
+## How the assignment maps to files
+
+| Assignment line                                       | Where you implement it                              |
+|-------------------------------------------------------|----------------------------------------------------|
+| Agent reads PR, analyzes, proposes comments           | `exercise_1_confidence.py` (analyze + routing)     |
+| Confidence-based routing (72% vs 58% etc.)            | `common/schemas.py` thresholds + `exercise_1`      |
+| 72% → diff + reasoning → user approves → commit       | `exercise_2_hitl.py`                                |
+| 58% → escalate with specific questions                | `exercise_3_escalation.py`                          |
+| PostgreSQL audit trail + replay full session          | `exercise_4_audit.py`, `audit/schema.sql`, `audit/replay.py` |
+
+## Bonus challenges
+
+1. **Time-travel.** Use `app.aget_state_history(config)` to list every checkpoint. Resume from an earlier checkpoint with a different reviewer answer and compare outcomes.
+2. **Confidence calibration.** After N sessions, query `audit_events` to compute `AVG(confidence)` vs `count(human_choice = 'approve')`. Is the model over- or under-confident?
+3. **Multi-reviewer fan-out.** Use the `Send` API to escalate the same questions to two reviewers (two threads) and wait for both.
+4. **Auto-edit.** When the human chooses `edit`, call the LLM again to rewrite the review using `human_feedback`, then commit.
+
+## FAQ / gotchas
+
+**`interrupt()` raises `GraphInterrupt` instead of pausing.**
+You forgot `checkpointer=...` in `.compile()`. Checkpointer is required for `interrupt()` to work.
+
+**Graph restarts from scratch on resume.**
+`thread_id` mismatch between the original `invoke` and the resuming `Command` call. Always print `thread_id` and use the same one when resuming.
+
+**Duplicate `gh pr comment` calls after resume.**
+Side-effects placed *before* `interrupt()` in the same node — the node re-runs from the top after resume. Move side-effects to a downstream node (e.g. `commit`).
+
+**`gh pr comment` returns 403.**
+Token lacks `public_repo` scope, or repo is private and you only have `public_repo`. Re-create the PAT with the right scope.
+
+**LLM stays overconfident on PR #2 and never escalates.**
+Temporarily raise `ESCALATE_THRESHOLD` in `common/schemas.py` to 0.75 to force the branch.
+
+**Postgres won't connect.**
+`docker compose ps` to confirm the container is up; `docker compose logs postgres` for errors. The host port is **1505** (not 5432) — see `docker-compose.yml`. `DATABASE_URL` in `.env` must use 1505.
+
+**`audit_events` schema is stale / column missing.**
+The `audit/schema.sql` file is loaded by docker via `docker-entrypoint-initdb.d` only on **first** container start. If you change the schema, wipe the volume and restart:
+```bash
+docker compose down -v && ./start_all.sh
+```
