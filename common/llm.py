@@ -6,6 +6,9 @@ from langchain_openai import ChatOpenAI
 
 
 def get_llm(temperature: float = 0.2) -> ChatOpenAI:
+    from dotenv import load_dotenv
+
+    load_dotenv(override=True)
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set — copy .env.example to .env")
